@@ -7,7 +7,7 @@
 ## 功能特性
 
 - **阿里云 ECS 监控**: 自动发现所有实例，显示 CPU 占用率、内存占用、运行状态（RPC API 正确 HMAC-SHA1 签名）
-- **ESXi 监控**: 通过 VMware Host Client REST API 获取数据，支持 frp 内网穿透访问，显示 CPU 占用率、内存占用、运行中 VM 数量
+- **ESXi 监控**: 通过 SOAP API（`/sdk`，vim_rs 实现）直连 ESXi，显示 CPU 占用率、内存占用、运行中 VM 数量
 - **DeepSeek 余额查询**: 实时显示账户余额和已用金额
 - **置顶悬浮窗口**: 始终置顶，可拖动，可隐藏到系统托盘
 - **自动刷新**: 每 5 秒自动刷新数据（后台线程采集，不阻塞 UI）
@@ -84,12 +84,16 @@ cargo run --release
 
 ### ESXi
 
+> 注意：ESXi 7.0 起已移除 hostd 的 `/rest/` REST API（请求会得到 400），
+> 程序通过 **SOAP API（`/sdk` 端点，与 govmomi 相同协议）** 连接，支持 ESXi 6.5+ 与 vCenter。
+
 - URL: ESXi 管理界面地址
-  - 直连: `https://ESXi-IP:443`
+  - 直连: `https://ESXi-IP:443`（或仅填 `ESXi-IP`）
   - 通过 frp 穿透: `https://云主机IP:映射端口`
   - 域名: `https://esxi.example.com:443`
 - User: 通常为 `root`
 - Password: root 用户的密码
+- 自签名证书环境请保持 `config.json` 中 `esxi.insecure: true`（默认）
 
 ### DeepSeek
 

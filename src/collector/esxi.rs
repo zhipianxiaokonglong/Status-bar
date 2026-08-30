@@ -1,13 +1,18 @@
-//! VMware ESXi：通过 Host Client REST API（/rest/com/vmware/cis/session）采集。
-//! 支持 frp 内网穿透场景（任意 base URL），尊重 config 的 insecure 开关。
+//! VMware ESXi：通过 vim_rs（SOAP/XML 传输）直连 ESXi 采集。
+//!
+//! ESXi 7.0 已移除 hostd 的 `/rest/` REST API（POST /rest/... 一律 400），
+//! 必须走 SOAP `/sdk` 端点（与 govmomi 相同的协议）。
+//! 本实现参考 PortalT（govmomi）与 vim_rs 的 SOAP/XML 传输模式。
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use vim_macros::vim_retrievable;
+use vim_rs::core::client::TransportMode;
+use vim_rs::core::pc_retrieve::ObjectRetriever;
+use vim_rs::core::ClientBuilder;
+use vim_rs::types::enums::VirtualMachinePowerStateEnum;
 
-use super::http_client;
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Clone, Default)]
 pub struct EsxiInfo {
@@ -20,212 +25,121 @@ pub struct EsxiInfo {
     pub total_vms: usize,
 }
 
-#[derive(Deserialize)]
-struct EsxiSession {
-    value: String,
-}
+// 主机属性（一次 RetrievePropertiesEx 拉取）
+vim_retrievable!(
+    struct HostProps: HostSystem {
+        name = "name",
+        cpu_mhz = "summary.hardware.cpu_mhz"?,
+        num_cpu_cores = "summary.hardware.num_cpu_cores"?,
+        memory_size = "summary.hardware.memory_size"?,
+        cpu_usage = "summary.quick_stats.overall_cpu_usage"?,
+        memory_usage = "summary.quick_stats.overall_memory_usage"?,
+    }
+);
 
-#[derive(Deserialize)]
-struct EsxiHostSummary {
-    #[serde(rename = "value")]
-    value: EsxiHostSummaryValue,
-}
+// 虚拟机属性（统计运行中数量）
+vim_retrievable!(
+    struct VmProps: VirtualMachine {
+        power_state = "runtime.power_state",
+    }
+);
 
-#[derive(Deserialize)]
-struct EsxiHostSummaryValue {
-    #[serde(rename = "hostHardwareInfo")]
-    host_hardware_info: EsxiHostHardwareInfo,
-    #[serde(rename = "hostHardwareSummary")]
-    host_hardware_summary: Option<EsxiHostHardwareSummary>,
-    #[serde(rename = "hostSystemResourceInfo")]
-    host_system_resource_info: EsxiHostSystemResourceInfo,
-}
-
-#[derive(Deserialize)]
-struct EsxiHostHardwareInfo {
-    #[serde(rename = "cpuMhz")]
-    cpu_mhz: i64,
-    #[serde(rename = "numCpuCores")]
-    num_cpu_cores: i64,
-    #[serde(rename = "memorySize")]
-    memory_size: i64,
-}
-
-#[derive(Deserialize)]
-struct EsxiHostHardwareSummary {
-    name: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct EsxiHostSystemResourceInfo {
-    #[serde(rename = "cpuUsage")]
-    cpu_usage: Option<EsxiCpuUsage>,
-    #[serde(rename = "memoryUsage")]
-    memory_usage: Option<EsxiMemoryUsage>,
-}
-
-#[derive(Deserialize)]
-struct EsxiCpuUsage {
-    #[serde(rename = "usageMhz")]
-    usage_mhz: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct EsxiMemoryUsage {
-    usage: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct EsxiVmList {
-    #[serde(rename = "value")]
-    value: Vec<EsxiVmItem>,
-}
-
-#[derive(Deserialize)]
-struct EsxiVmItem {
-    #[serde(rename = "vm")]
-    vm: EsxiVm,
-}
-
-#[derive(Deserialize)]
-struct EsxiVm {
-    #[serde(rename = "powerState")]
-    power_state: Option<String>,
-}
-
+/// 采集 ESXi 主机信息与 VM 列表（CPU/内存使用率、运行中 VM 数）。
 pub fn collect(raw_url: &str, user: &str, password: &str, insecure: bool) -> Result<EsxiInfo, String> {
     if raw_url.trim().is_empty() {
         return Err("ESXi URL 未配置".into());
     }
 
-    let base = normalize_base(raw_url);
-    let client = http_client(REQUEST_TIMEOUT, insecure)?;
+    let host = normalize_host(raw_url)?;
 
-    // 登录拿 session id
-    // 注意：VMware vAPI 要求 POST 携带 Content-Type: application/json，
-    // 缺失时 hostd 直接返回 400 Bad Request（原 Go 版有此头，Rust 版曾遗漏）。
-    let session_url = format!("{base}/rest/com/vmware/cis/session");
-    let resp = client
-        .post(&session_url)
-        .header("Content-Type", "application/json")
-        .basic_auth(user, Some(password))
-        .send()
-        .map_err(|e| format!("登录请求失败: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().unwrap_or_default();
-        super::write_log(&format!(
-            "ESXi 登录失败: {session_url} (HTTP {status}) body: {body}"
-        ));
-        return Err(format!("登录失败 (HTTP {status}): {}", truncate(&body)));
-    }
-    let session: EsxiSession =
-        serde_json::from_str(&resp.text().map_err(|e| e.to_string())?)
-            .map_err(|e| format!("解析登录响应失败: {e}"))?;
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("创建 tokio 运行时失败: {e}"))?;
+    rt.block_on(async move { collect_async(&host, user, password, insecure).await })
+}
+
+async fn collect_async(
+    host: &str,
+    user: &str,
+    password: &str,
+    insecure: bool,
+) -> Result<EsxiInfo, String> {
+    // SOAP 会话基于 HTTP cookie（vmware_soap_session），必须启用 cookie_store
+    let http = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .cookie_store(true)
+        .danger_accept_invalid_certs(insecure)
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+
+    let client = ClientBuilder::new(host, http)
+        .basic_authn(user, password)
+        .app_details("statusbar", env!("CARGO_PKG_VERSION"))
+        .transport(TransportMode::Soap)
+        .build()
+        .await
+        .map_err(|e| {
+            super::write_log(&format!("ESXi 连接失败: {host} (insecure={insecure}): {e}"));
+            format!("连接 ESXi 失败: {e}")
+        })?;
+
+    let root_folder = client.service_content().root_folder.clone();
+    let retriever = ObjectRetriever::new(client.clone()).map_err(|e| e.to_string())?;
 
     let mut info = EsxiInfo::default();
 
-    // 主机摘要
-    let summary_body = api_get(&client, &base, &session.value, "/rest/vmware/host/summary")?;
-    let summary: EsxiHostSummary = serde_json::from_str(&summary_body)
-        .map_err(|e| format!("解析主机摘要失败: {e}"))?;
+    // 主机信息（ESXi 单机：root folder 下第一台 HostSystem）
+    let hosts: Vec<HostProps> = retriever
+        .retrieve_objects_from_container(&root_folder)
+        .await
+        .map_err(|e| format!("获取主机信息失败: {e}"))?;
 
-    let hw = &summary.value.host_hardware_info;
-    info.total_memory = hw.memory_size.max(0) as u64;
+    if let Some(host) = hosts.first() {
+        info.host_name = host.name.clone();
 
-    let total_cpu_mhz = hw.cpu_mhz.saturating_mul(hw.num_cpu_cores);
-    if let Some(usage) = summary
-        .value
-        .host_system_resource_info
-        .cpu_usage
-        .as_ref()
-        .and_then(|c| c.usage_mhz)
-        && total_cpu_mhz > 0 {
-            info.cpu_usage = usage as f64 / total_cpu_mhz as f64 * 100.0;
+        if let Some(memory_size) = host.memory_size {
+            info.total_memory = memory_size.max(0) as u64;
         }
 
-    if let Some(mem) = summary.value.host_system_resource_info.memory_usage.as_ref()
-        && let Some(used) = mem.usage {
-            info.used_memory = used.max(0) as u64;
-            if hw.memory_size > 0 {
-                info.memory_usage = used as f64 / hw.memory_size as f64 * 100.0;
+        if let (Some(cpu_mhz), Some(num_cores)) = (host.cpu_mhz, host.num_cpu_cores) {
+            let total_cpu_mhz = cpu_mhz as i64 * num_cores as i64;
+            if total_cpu_mhz > 0 && let Some(usage_mhz) = host.cpu_usage {
+                info.cpu_usage = usage_mhz as f64 / total_cpu_mhz as f64 * 100.0;
             }
         }
 
-    if let Some(name) = summary
-        .value
-        .host_hardware_summary
-        .as_ref()
-        .and_then(|s| s.name.clone())
-    {
-        info.host_name = name;
+        // overall_memory_usage 单位为 MB；memory_size 单位为字节
+        if let Some(memory_size) = host.memory_size
+            && memory_size > 0 && let Some(used_mb) = host.memory_usage {
+                info.used_memory = (used_mb as u64).saturating_mul(1024 * 1024);
+                info.memory_usage = info.used_memory as f64 / memory_size as f64 * 100.0;
+            }
     }
 
-    // VM 列表（失败不影响主机数据）
-    if let Ok(vm_body) = api_get(&client, &base, &session.value, "/rest/vmware/host/vm-list")
-        && let Ok(list) = serde_json::from_str::<EsxiVmList>(&vm_body) {
-            info.total_vms = list.value.len();
-            for item in &list.value {
-                if item
-                    .vm
-                    .power_state
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("POWERED_ON"))
-                {
-                    info.running_vms += 1;
-                }
-            }
-        }
-
-    // 数据采集完成后登出（尽力而为，先采集后登出：登出会终止会话）
-    let _ = client
-        .delete(&session_url)
-        .header("vmware-api-session-id", &session.value)
-        .send();
+    // VM 列表与运行状态（失败不影响主机数据）
+    if let Ok(vms) = retriever
+        .retrieve_objects_from_container::<VmProps>(&root_folder)
+        .await
+    {
+        info.total_vms = vms.len();
+        info.running_vms = vms
+            .iter()
+            .filter(|vm| vm.power_state == VirtualMachinePowerStateEnum::PoweredOn)
+            .count();
+    }
 
     Ok(info)
 }
 
-fn api_get(client: &reqwest::blocking::Client, base: &str, session_id: &str, path: &str) -> Result<String, String> {
-    let url = format!("{base}{path}");
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/json")
-        .header("vmware-api-session-id", session_id)
-        .send()
-        .map_err(|e| format!("请求 {path} 失败: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
-    if !status.is_success() {
-        super::write_log(&format!(
-            "ESXi 请求失败: {url} (HTTP {status}) body: {body}"
-        ));
-        return Err(format!("请求 {path} 失败 (HTTP {status}): {}", truncate(&body)));
+/// 归一化用户输入的 URL 为 vim_rs 需要的 host[:port]（去掉 scheme 与路径）。
+fn normalize_host(raw: &str) -> Result<String, String> {
+    let s = raw.trim();
+    let without_scheme = s
+        .strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .unwrap_or(s);
+    let host_port = without_scheme.split('/').next().unwrap_or("").trim();
+    if host_port.is_empty() {
+        return Err(format!("ESXi URL 无效: {raw}"));
     }
-    Ok(body)
-}
-
-/// 截断错误响应体，避免超长/含敏感信息的响应直接回显到界面。
-fn truncate(s: &str) -> String {
-    let preview: String = s.chars().take(200).collect();
-    if s.chars().count() > 200 {
-        format!("{preview}…")
-    } else {
-        preview
-    }
-}
-
-/// 归一化 base URL：补 https 前缀、去掉路径，只保留 scheme://host[:port]。
-fn normalize_base(raw: &str) -> String {
-    let mut s = raw.trim().to_string();
-    if !s.starts_with("http://") && !s.starts_with("https://") {
-        s = format!("https://{s}");
-    }
-    if let Some(scheme_end) = s.find("://") {
-        let after = &s[scheme_end + 3..];
-        if let Some(slash) = after.find('/') {
-            s.truncate(scheme_end + 3 + slash);
-        }
-    }
-    s.trim_end_matches('/').to_string()
+    Ok(host_port.to_string())
 }
