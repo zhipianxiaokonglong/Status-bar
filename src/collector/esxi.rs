@@ -102,15 +102,21 @@ pub fn collect(raw_url: &str, user: &str, password: &str, insecure: bool) -> Res
     let client = http_client(REQUEST_TIMEOUT, insecure)?;
 
     // 登录拿 session id
+    // 注意：VMware vAPI 要求 POST 携带 Content-Type: application/json，
+    // 缺失时 hostd 直接返回 400 Bad Request（原 Go 版有此头，Rust 版曾遗漏）。
     let session_url = format!("{base}/rest/com/vmware/cis/session");
     let resp = client
         .post(&session_url)
+        .header("Content-Type", "application/json")
         .basic_auth(user, Some(password))
         .send()
         .map_err(|e| format!("登录请求失败: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
+        super::write_log(&format!(
+            "ESXi 登录失败: {session_url} (HTTP {status}) body: {body}"
+        ));
         return Err(format!("登录失败 (HTTP {status}): {}", truncate(&body)));
     }
     let session: EsxiSession =
@@ -181,14 +187,19 @@ pub fn collect(raw_url: &str, user: &str, password: &str, insecure: bool) -> Res
 }
 
 fn api_get(client: &reqwest::blocking::Client, base: &str, session_id: &str, path: &str) -> Result<String, String> {
+    let url = format!("{base}{path}");
     let resp = client
-        .get(format!("{base}{path}"))
+        .get(&url)
+        .header("Accept", "application/json")
         .header("vmware-api-session-id", session_id)
         .send()
         .map_err(|e| format!("请求 {path} 失败: {e}"))?;
     let status = resp.status();
     let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
     if !status.is_success() {
+        super::write_log(&format!(
+            "ESXi 请求失败: {url} (HTTP {status}) body: {body}"
+        ));
         return Err(format!("请求 {path} 失败 (HTTP {status}): {}", truncate(&body)));
     }
     Ok(body)
