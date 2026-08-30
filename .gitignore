@@ -1,0 +1,17 @@
+# Executables
+*.exe
+*.exe.manifest
+
+# Runtime config (auto-generated, contains machine-specific settings)
+config.json
+
+# Go build artifacts
+*.obj
+*.test
+*.out
+/bin/
+/vendor/
+
+# OS files
+.DS_Store
+Thumbs.db
