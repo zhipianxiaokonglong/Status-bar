@@ -5,12 +5,8 @@
 # Runtime config (auto-generated, contains machine-specific settings)
 config.json
 
-# Go build artifacts
-*.obj
-*.test
-*.out
-/bin/
-/vendor/
+# Rust build artifacts
+/target
 
 # OS files
 .DS_Store
