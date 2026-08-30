@@ -121,20 +121,40 @@ impl StatusBarApp {
         self.trigger_refresh();
     }
 
+    /// 在后台线程执行采集；catch_unwind 保护，线程 panic 也会复位 in-flight 并回报错误。
+    fn spawn_collect<T: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> Result<T, String> + Send + 'static,
+        wrap: impl FnOnce(Result<T, String>) -> RefreshMsg + Send + 'static,
+    ) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+                    Err("采集线程发生内部错误".to_string())
+                });
+            let _ = tx.send(wrap(result));
+        });
+    }
+
     /// 按配置触发各模块的后台采集（防堆积：in-flight 时跳过）。
     fn trigger_refresh(&mut self) {
         let now = chrono::Local::now().format("%H:%M:%S").to_string();
 
         if self.cfg.display.show_aliyun {
             if self.creds.has_aliyun() && !self.aliyun_inflight {
-                let cred = self.creds.aliyun.clone().expect("checked");
+                let Some(cred) = self.creds.aliyun.clone() else {
+                    return;
+                };
                 let region = self.cfg.aliyun.region.clone();
-                let tx = self.tx.clone();
                 self.aliyun_inflight = true;
-                std::thread::spawn(move || {
-                    let c = aliyun::AliyunCollector::new(region, cred.access_key_id, cred.access_key_secret);
-                    let _ = tx.send(RefreshMsg::Aliyun(c.collect()));
-                });
+                self.spawn_collect(
+                    move || {
+                        let c = aliyun::AliyunCollector::new(region, cred.access_key_id, cred.access_key_secret)?;
+                        c.collect()
+                    },
+                    RefreshMsg::Aliyun,
+                );
             } else if !self.creds.has_aliyun() {
                 self.aliyun_text = "  阿里云: [未配置]".to_string();
             }
@@ -144,14 +164,15 @@ impl StatusBarApp {
 
         if self.cfg.display.show_esxi {
             if self.creds.has_esxi() && !self.esxi_inflight {
-                let cred = self.creds.esxi.clone().expect("checked");
+                let Some(cred) = self.creds.esxi.clone() else {
+                    return;
+                };
                 let insecure = self.cfg.esxi.insecure;
-                let tx = self.tx.clone();
                 self.esxi_inflight = true;
-                std::thread::spawn(move || {
-                    let res = esxi::collect(&cred.url, &cred.user, &cred.password, insecure);
-                    let _ = tx.send(RefreshMsg::Esxi(res));
-                });
+                self.spawn_collect(
+                    move || esxi::collect(&cred.url, &cred.user, &cred.password, insecure),
+                    RefreshMsg::Esxi,
+                );
             } else if !self.creds.has_esxi() {
                 self.esxi_text = "  ESXi: [未配置]".to_string();
             }
@@ -161,14 +182,15 @@ impl StatusBarApp {
 
         if self.cfg.display.show_deepseek {
             if self.creds.has_deepseek() && !self.ds_inflight {
-                let cred = self.creds.deepseek.clone().expect("checked");
+                let Some(cred) = self.creds.deepseek.clone() else {
+                    return;
+                };
                 let base_url = self.cfg.deepseek.base_url.clone();
-                let tx = self.tx.clone();
                 self.ds_inflight = true;
-                std::thread::spawn(move || {
-                    let res = deepseek::collect(&cred.api_key, &base_url);
-                    let _ = tx.send(RefreshMsg::DeepSeek(res));
-                });
+                self.spawn_collect(
+                    move || deepseek::collect(&cred.api_key, &base_url),
+                    RefreshMsg::DeepSeek,
+                );
             } else if !self.creds.has_deepseek() {
                 self.ds_text = "  DeepSeek: [未配置]".to_string();
             }
@@ -222,10 +244,16 @@ impl StatusBarApp {
                 RefreshMsg::DeepSeek(Ok(b)) => {
                     self.ds_inflight = false;
                     let unit = if b.currency == "CNY" { "¥" } else { "" };
-                    self.ds_text = format!(
-                        "  DeepSeek: 余额 {unit}{:.2} | 已用 {unit}{:.2}",
-                        b.balance, b.total_used
-                    );
+                    // DeepSeek 官方 /user/balance 响应不含 total_consumed，
+                    // 仅在有该字段（兼容其他网关）时才显示"已用"。
+                    if b.total_used > 0.0 {
+                        self.ds_text = format!(
+                            "  DeepSeek: 余额 {unit}{:.2} | 已用 {unit}{:.2}",
+                            b.balance, b.total_used
+                        );
+                    } else {
+                        self.ds_text = format!("  DeepSeek: 余额 {unit}{:.2}", b.balance);
+                    }
                 }
                 RefreshMsg::DeepSeek(Err(e)) => {
                     self.ds_inflight = false;
@@ -247,6 +275,9 @@ impl eframe::App for StatusBarApp {
             self.last_refresh = Instant::now();
             self.trigger_refresh();
         }
+
+        // 调度下一帧：空闲/窗口隐藏时也保持定时刷新与托盘事件轮询
+        ctx.request_repaint_after(REFRESH_INTERVAL);
     }
 
     /// 绘制界面。

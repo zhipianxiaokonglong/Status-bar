@@ -111,17 +111,11 @@ pub fn collect(raw_url: &str, user: &str, password: &str, insecure: bool) -> Res
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().unwrap_or_default();
-        return Err(format!("登录失败 (HTTP {status}): {body}"));
+        return Err(format!("登录失败 (HTTP {status}): {}", truncate(&body)));
     }
     let session: EsxiSession =
         serde_json::from_str(&resp.text().map_err(|e| e.to_string())?)
             .map_err(|e| format!("解析登录响应失败: {e}"))?;
-
-    // 登出（尽力而为）
-    let _ = client
-        .delete(&session_url)
-        .header("vmware-api-session-id", &session.value)
-        .send();
 
     let mut info = EsxiInfo::default();
 
@@ -177,6 +171,12 @@ pub fn collect(raw_url: &str, user: &str, password: &str, insecure: bool) -> Res
             }
         }
 
+    // 数据采集完成后登出（尽力而为，先采集后登出：登出会终止会话）
+    let _ = client
+        .delete(&session_url)
+        .header("vmware-api-session-id", &session.value)
+        .send();
+
     Ok(info)
 }
 
@@ -189,9 +189,19 @@ fn api_get(client: &reqwest::blocking::Client, base: &str, session_id: &str, pat
     let status = resp.status();
     let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
     if !status.is_success() {
-        return Err(format!("请求 {path} 失败 (HTTP {status}): {body}"));
+        return Err(format!("请求 {path} 失败 (HTTP {status}): {}", truncate(&body)));
     }
     Ok(body)
+}
+
+/// 截断错误响应体，避免超长/含敏感信息的响应直接回显到界面。
+fn truncate(s: &str) -> String {
+    let preview: String = s.chars().take(200).collect();
+    if s.chars().count() > 200 {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 /// 归一化 base URL：补 https 前缀、去掉路径，只保留 scheme://host[:port]。

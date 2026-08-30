@@ -4,52 +4,67 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub aliyun: AliyunConfig,
     pub esxi: EsxiConfig,
     pub deepseek: DeepSeekConfig,
     pub display: DisplayConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+}#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AliyunConfig {
     pub region: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EsxiConfig {
     pub insecure: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DeepSeekConfig {
     pub base_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DisplayConfig {
     pub show_aliyun: bool,
     pub show_esxi: bool,
     pub show_deepseek: bool,
 }
 
-impl Default for Config {
+impl Default for AliyunConfig {
     fn default() -> Self {
         Self {
-            aliyun: AliyunConfig {
-                region: "cn-hangzhou".into(),
-            },
-            esxi: EsxiConfig { insecure: true },
-            deepseek: DeepSeekConfig {
-                base_url: "https://api.deepseek.com".into(),
-            },
-            display: DisplayConfig {
-                show_aliyun: true,
-                show_esxi: true,
-                show_deepseek: true,
-            },
+            region: "cn-hangzhou".into(),
+        }
+    }
+}
+
+impl Default for EsxiConfig {
+    fn default() -> Self {
+        Self { insecure: true }
+    }
+}
+
+impl Default for DeepSeekConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.deepseek.com".into(),
+        }
+    }
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self {
+        Self {
+            show_aliyun: true,
+            show_esxi: true,
+            show_deepseek: true,
         }
     }
 }

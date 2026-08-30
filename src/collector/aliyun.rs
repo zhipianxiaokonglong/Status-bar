@@ -33,11 +33,17 @@ pub struct AliyunCollector {
     region: String,
     ak: String,
     sk: String,
+    client: reqwest::blocking::Client,
 }
 
 impl AliyunCollector {
-    pub fn new(region: String, access_key_id: String, access_key_secret: String) -> Self {
-        Self {
+    pub fn new(
+        region: String,
+        access_key_id: String,
+        access_key_secret: String,
+    ) -> Result<Self, String> {
+        let client = http_client(REQUEST_TIMEOUT, false)?;
+        Ok(Self {
             region: if region.is_empty() {
                 "cn-hangzhou".into()
             } else {
@@ -45,7 +51,8 @@ impl AliyunCollector {
             },
             ak: access_key_id,
             sk: access_key_secret,
-        }
+            client,
+        })
     }
 
     pub fn collect(&self) -> Result<Vec<EcsInstance>, String> {
@@ -60,7 +67,7 @@ impl AliyunCollector {
             ],
         )?;
 
-        let body = get_text(&url)?;
+        let body = self.get_text(&url)?;
         let v: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("解析响应失败: {e}"))?;
 
@@ -94,12 +101,20 @@ impl AliyunCollector {
                     instance_name: get_str(item, "InstanceName"),
                     status: get_str(item, "Status"),
                     public_ip,
-                    cpu_usage: self.query_metric(&get_str(item, "InstanceId"), "CPUUtilization"),
-                    memory_usage: self.query_metric(&get_str(item, "InstanceId"), "MemoryUtilization"),
+                    cpu_usage: 0.0,
+                    memory_usage: 0.0,
                     region: self.region.clone(),
                 });
             }
         }
+
+        // 只为将要展示的首台实例查询监控指标（其余实例仅在计数中体现），
+        // 避免每实例 2 个串行请求导致大账号下刷新长时间阻塞。
+        if let Some(first) = instances.first_mut() {
+            first.cpu_usage = self.query_metric(&first.instance_id, "CPUUtilization");
+            first.memory_usage = self.query_metric(&first.instance_id, "MemoryUtilization");
+        }
+
         Ok(instances)
     }
 
@@ -122,7 +137,7 @@ impl AliyunCollector {
             Ok(u) => u,
             Err(_) => return 0.0,
         };
-        let Ok(body) = get_text(&url) else {
+        let Ok(body) = self.get_text(&url) else {
             return 0.0;
         };
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) else {
@@ -132,21 +147,34 @@ impl AliyunCollector {
             .and_then(|a| a.as_f64())
             .unwrap_or(0.0)
     }
+
+    fn get_text(&self, url: &str) -> Result<String, String> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .map_err(|e| format!("请求失败: {e}"))?;
+        let status = resp.status();
+        let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("HTTP 错误 ({status}): {}", truncate(&body)));
+        }
+        Ok(body)
+    }
+}
+
+/// 截断错误响应体，避免超长/含敏感信息的响应直接回显到界面。
+fn truncate(s: &str) -> String {
+    let preview: String = s.chars().take(200).collect();
+    if s.chars().count() > 200 {
+        format!("{preview}…")
+    } else {
+        preview
+    }
 }
 
 fn get_str(v: &serde_json::Value, key: &str) -> String {
     v.get(key).and_then(|x| x.as_str()).unwrap_or("").to_string()
-}
-
-fn get_text(url: &str) -> Result<String, String> {
-    let client = http_client(REQUEST_TIMEOUT, false)?;
-    let resp = client.get(url).send().map_err(|e| format!("请求失败: {e}"))?;
-    let status = resp.status();
-    let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("HTTP 错误 ({status}): {body}"));
-    }
-    Ok(body)
 }
 
 /// 阿里云 RPC 签名（SignatureMethod=HMAC-SHA1, SignatureVersion=1.0）。

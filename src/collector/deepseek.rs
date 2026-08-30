@@ -30,7 +30,8 @@ pub fn collect(api_key: &str, base_url: &str) -> Result<DeepSeekBalance, String>
     let status = resp.status();
     let body = resp.text().map_err(|e| format!("读取响应失败: {e}"))?;
     if !status.is_success() {
-        return Err(format!("API 错误 (HTTP {status}): {body}"));
+        let preview: String = body.chars().take(200).collect();
+        return Err(format!("API 错误 (HTTP {status}): {preview}"));
     }
 
     let v: Value = serde_json::from_str(&body).map_err(|e| format!("解析响应失败: {e}"))?;
